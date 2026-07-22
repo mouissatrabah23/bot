@@ -1,0 +1,11 @@
+python-telegram-bot[job-queue]>=20.7,<21.0
+httpx>=0.26,<0.28
+python-dotenv>=1.0.0
+apscheduler>=3.10,<4.0
+# IANA timezone database, so zoneinfo("Africa/Algiers") works on Windows and
+# minimal installs (Linux/macOS usually ship it system-wide, but this is safe).
+tzdata>=2024.1
+
+# --- dev / testing (optional) ---
+pytest>=8.0
+pytest-asyncio>=0.23
