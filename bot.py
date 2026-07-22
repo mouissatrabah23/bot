@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
+import uuid
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from telegram import (
@@ -25,7 +28,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TelegramError, TimedOut
+from telegram.error import Conflict, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -99,6 +102,43 @@ logging.basicConfig(
 # Quiet the very chatty httpx request logger.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("yaqadha")
+
+# ---------------------------------------------------------------------------
+# Instance identity — diagnoses "Conflict: terminated by other getUpdates
+# request" errors, which Telegram raises when TWO processes are long-polling
+# with the same bot token at once (e.g. an old and a new Railway deployment
+# both still running, or a stray local run alongside a deployed one).
+#
+# INSTANCE_ID is a fresh random id per process start, so even two processes on
+# the exact same host are distinguishable in the logs. The RAILWAY_* values are
+# only present when actually running on Railway; elsewhere they show "not set".
+# ---------------------------------------------------------------------------
+INSTANCE_ID = uuid.uuid4().hex[:8]
+HOSTNAME = socket.gethostname()
+PID = os.getpid()
+STARTED_AT = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+RAILWAY_REPLICA_ID = os.getenv("RAILWAY_REPLICA_ID", "not set (not on Railway?)")
+RAILWAY_DEPLOYMENT_ID = os.getenv("RAILWAY_DEPLOYMENT_ID", "not set")
+RAILWAY_SERVICE_ID = os.getenv("RAILWAY_SERVICE_ID", "not set")
+RAILWAY_SERVICE_NAME = os.getenv("RAILWAY_SERVICE_NAME", "not set")
+RAILWAY_ENVIRONMENT_NAME = os.getenv("RAILWAY_ENVIRONMENT_NAME", "not set")
+
+
+def _log_instance_identity() -> None:
+    """Print a clear identity block so overlapping instances are diagnosable."""
+    logger.info("=" * 60)
+    logger.info("Yaqadha instance starting")
+    logger.info("  instance_id            = %s", INSTANCE_ID)
+    logger.info("  hostname                = %s", HOSTNAME)
+    logger.info("  pid                     = %s", PID)
+    logger.info("  started_at              = %s", STARTED_AT)
+    logger.info("  railway_replica_id      = %s", RAILWAY_REPLICA_ID)
+    logger.info("  railway_deployment_id   = %s", RAILWAY_DEPLOYMENT_ID)
+    logger.info("  railway_service_id      = %s", RAILWAY_SERVICE_ID)
+    logger.info("  railway_service_name    = %s", RAILWAY_SERVICE_NAME)
+    logger.info("  railway_environment     = %s", RAILWAY_ENVIRONMENT_NAME)
+    logger.info("=" * 60)
+
 
 # Keys we stash in context.user_data to track a short pending interaction.
 _AWAITING = "awaiting_location"  # value: "subscribe" | "update"
@@ -447,7 +487,25 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Network hiccups (timeouts, dropped connections) are expected on a flaky
     # link and self-recover — log them as a one-line warning, not a scary
     # traceback. Everything else is a real bug and gets the full stack.
-    if isinstance(err, (TimedOut, NetworkError)):
+    if isinstance(err, Conflict):
+        # Telegram allows only ONE active getUpdates long-poll per bot token.
+        # This means another process is ALSO polling with this same token right
+        # now — almost always a duplicate/leftover deployment, not a transient
+        # network issue. Log this instance's own identity every time so the
+        # logs make it obvious which process this message is coming from when
+        # comparing against other running copies.
+        logger.error(
+            "Conflict: another process is polling with this same bot token "
+            "(instance_id=%s hostname=%s pid=%s railway_replica_id=%s "
+            "railway_deployment_id=%s). This is NOT a network glitch — it means "
+            "two instances are running simultaneously. On Railway: check the "
+            "Deployments tab for more than one 'Active' deployment, check "
+            "Settings > Replicas is set to 1, and make sure no local "
+            "`python bot.py` or old Railway CLI session is still running "
+            "with the same TELEGRAM_BOT_TOKEN.",
+            INSTANCE_ID, HOSTNAME, PID, RAILWAY_REPLICA_ID, RAILWAY_DEPLOYMENT_ID,
+        )
+    elif isinstance(err, (TimedOut, NetworkError)):
         logger.warning("Telegram network issue (will retry): %s", err)
     else:
         logger.exception("Unhandled error in handler: %s", err)
@@ -471,6 +529,7 @@ def _validate_config() -> None:
 
 
 def main() -> None:
+    _log_instance_identity()
     _validate_config()
 
     db = Database(DATABASE_PATH)

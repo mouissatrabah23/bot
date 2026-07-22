@@ -193,6 +193,37 @@ See [.env.example](.env.example) for the full, commented list. The essentials:
 
 ## Troubleshooting
 
+**`telegram.error.Conflict: terminated by other getUpdates request`.**
+Telegram allows only ONE process to long-poll with a given bot token at a
+time. This error means a SECOND process is polling with the same
+`TELEGRAM_BOT_TOKEN` right now — it is not a network glitch, and it will keep
+recurring every ~30s until the duplicate is stopped. Every startup now logs an
+identity block, and every Conflict occurrence logs it again:
+```
+Yaqadha instance starting
+  instance_id            = a1b2c3d4
+  hostname                = ...
+  pid                     = ...
+  railway_replica_id      = ...
+  railway_deployment_id   = ...
+```
+On Railway, check, in order:
+1. **Deployments tab** — is there more than one deployment showing as
+   active/running? An old deploy that didn't fully stop before the new one
+   started is the most common cause.
+2. **Settings → Replicas** — must be `1`. If it's higher, every replica runs
+   its own copy of `bot.py`, all polling with the same token simultaneously.
+3. **Other services/projects** — search your Railway account for any other
+   service that also has this `TELEGRAM_BOT_TOKEN` set (e.g. a duplicate
+   service created while troubleshooting).
+4. **Local runs** — make sure no `python bot.py` is still running on any
+   machine (including via `railway run`), and check `Get-Process python` /
+   `ps aux | grep bot.py`.
+5. If you still see the conflict after confirming exactly one instance is
+   running, the token may be in use elsewhere (e.g. if it was ever shared or
+   committed) — rotate it via **@BotFather → `/revoke`** and update
+   `TELEGRAM_BOT_TOKEN` everywhere it's configured.
+
 **The bot logs `returned 0 hotspot(s)` even though fires are being reported in
 the news.** This is almost always `FIRMS_DAY_RANGE=1`. FIRMS "day 1" is the
 single most-recent day bucket, and near-real-time detections arrive with an
