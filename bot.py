@@ -64,11 +64,25 @@ FILTER_STATIC_SOURCES = os.getenv("FILTER_STATIC_SOURCES", "true").strip().lower
 )
 FLARE_MIN_DAYS = int(os.getenv("FLARE_MIN_DAYS", "3"))
 FLARE_WINDOW_DAYS = int(os.getenv("FLARE_WINDOW_DAYS", "10"))
+# Safety override: a detection at/above this FRP (fire radiative power, in MW)
+# inside an otherwise-persistent cell is treated as a real (possibly growing)
+# wildfire and alerted anyway, never silently suppressed as a gas flare. Real
+# flares measured in this project sit around ~1-2 MW; real vegetation fires
+# ranged ~3-41+ MW. Lower this if you'd rather over-alert than risk a miss.
+FLARE_OVERRIDE_MIN_FRP = float(os.getenv("FLARE_OVERRIDE_MIN_FRP", "10"))
 # Reverse geocoding (Nominatim/OpenStreetMap) for precise place names in alerts.
 ENABLE_GEOCODING = os.getenv("ENABLE_GEOCODING", "true").strip().lower() not in (
     "0", "false", "no", "off", ""
 )
 GEOCODING_LANGUAGE = os.getenv("GEOCODING_LANGUAGE", "ar").strip() or "ar"
+# Per-request timeout for a single Nominatim lookup (seconds). Kept short —
+# Nominatim normally answers in well under a second, and a slow/unreachable
+# request is a dead end, not something worth waiting out.
+GEOCODE_TIMEOUT_SECONDS = float(os.getenv("GEOCODE_TIMEOUT_SECONDS", "6"))
+# Hard wall-clock cap on the ENTIRE geocoding phase per polling cycle. Once hit,
+# remaining not-yet-cached cells fall back to wilaya naming so real alerts are
+# never held up waiting on a slow/flaky third-party service.
+GEOCODE_MAX_SECONDS_PER_CYCLE = float(os.getenv("GEOCODE_MAX_SECONDS_PER_CYCLE", "20"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "yaqadha.db")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 # Optional proxy for reaching Telegram, e.g. http://127.0.0.1:8080 or
@@ -485,7 +499,11 @@ def main() -> None:
         dataset=FIRMS_DATASET,
         day_range=FIRMS_DAY_RANGE,
     )
-    geocoder = Geocoder(db, language=GEOCODING_LANGUAGE) if ENABLE_GEOCODING else None
+    geocoder = (
+        Geocoder(db, language=GEOCODING_LANGUAGE, timeout=GEOCODE_TIMEOUT_SECONDS)
+        if ENABLE_GEOCODING
+        else None
+    )
     engine = AlertEngine(
         bot=application.bot,
         db=db,
@@ -495,7 +513,9 @@ def main() -> None:
         filter_static_sources=FILTER_STATIC_SOURCES,
         flare_min_days=FLARE_MIN_DAYS,
         flare_window_days=FLARE_WINDOW_DAYS,
+        flare_override_min_frp=FLARE_OVERRIDE_MIN_FRP,
         geocoder=geocoder,
+        geocode_max_seconds_per_cycle=GEOCODE_MAX_SECONDS_PER_CYCLE,
     )
 
     # Stash shared objects where handlers and jobs can reach them.

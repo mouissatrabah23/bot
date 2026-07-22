@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -84,7 +85,9 @@ class AlertEngine:
         filter_static_sources: bool = True,
         flare_min_days: int = 3,
         flare_window_days: int = 10,
+        flare_override_min_frp: float = 10.0,
         geocoder=None,
+        geocode_max_seconds_per_cycle: float = 20.0,
     ):
         self.bot = bot
         self.db = db
@@ -94,12 +97,32 @@ class AlertEngine:
         # Optional reverse geocoder (geocoding.Geocoder). When set, alerts name
         # the nearest real place; when None they fall back to the wilaya name.
         self.geocoder = geocoder
+        # SAFETY: precise place names are a nicety, not the safety-critical part
+        # of an alert — the wilaya-based fallback already conveys "where".
+        # Reverse geocoding must never meaningfully delay the actual alert, so
+        # the whole geocoding phase of a cycle is capped at this many wall-clock
+        # seconds; once exceeded, remaining NEW lookups are skipped (falling
+        # back to wilaya naming) and personal alerts go out immediately.
+        # Measured impact without this cap: a flaky/slow Nominatim connection
+        # added 120+ seconds to a single polling cycle in testing.
+        self.geocode_max_seconds_per_cycle = geocode_max_seconds_per_cycle
         # Gas-flare / static-source suppression: a ~1km cell seen on at least
         # flare_min_days distinct days within flare_window_days is treated as a
         # persistent industrial source (not a wildfire) and filtered out.
+        #
+        # SAFETY OVERRIDE: a real wildfire that keeps burning/reigniting in
+        # roughly the same footprint for several days looks identical to a gas
+        # flare under that rule alone (same cell, multiple distinct days) — and
+        # would otherwise go completely silent right when it matters most (see
+        # the flare_override_min_frp check in _drop_static_sources). Real flares
+        # measured in this project sit at ~1-2 MW FRP; measured vegetation fires
+        # ranged ~3-41+ MW. Any detection at/above flare_override_min_frp inside
+        # an otherwise-persistent cell is treated as a genuine fire and let
+        # through, regardless of how many days the cell has recurred.
         self.filter_static_sources = filter_static_sources
         self.flare_min_days = flare_min_days
         self.flare_window_days = flare_window_days
+        self.flare_override_min_frp = flare_override_min_frp
 
     # -- orchestration ---------------------------------------------------
     async def process_hotspots(self, hotspots: list[Hotspot]) -> None:
@@ -117,11 +140,25 @@ class AlertEngine:
         #    source history keeps building even for hotspots we then suppress.
         self._record_cells(hotspots)
 
+        # Compute the persistent-cell set once per cycle (reused by filtering
+        # AND by the diagnostic trace below, avoiding a duplicate DB query).
+        persistent_cells = (
+            self.db.get_persistent_cells(self.flare_min_days, self.flare_window_days)
+            if self.filter_static_sources
+            else set()
+        )
+
+        # Diagnostic: for every hotspot near an active subscriber, log whether
+        # it passed each filter stage and why — independent of what actually
+        # gets sent, so "why didn't I get alerted" is always answerable from
+        # the logs. Never affects which alerts are sent.
+        self._log_subscriber_relevant_hotspots(hotspots, persistent_cells)
+
         # 1) Keep only sufficiently confident, in-country, non-static, not-yet-
         #    seen hotspots.
         relevant = self._relevant(hotspots)
         before_flare = len(relevant)
-        relevant = self._drop_static_sources(relevant)
+        relevant = self._drop_static_sources(relevant, persistent_cells)
         if before_flare != len(relevant):
             logger.info(
                 "Suppressed %d detection(s) at persistent static sources (gas flares).",
@@ -172,35 +209,156 @@ class AlertEngine:
         ]
         self.db.record_cell_observations(pairs)
 
-    def _drop_static_sources(self, hotspots: list[Hotspot]) -> list[Hotspot]:
-        """Remove detections at persistent static sources (gas flares)."""
+    def _is_flare_override(self, hs: Hotspot) -> bool:
+        """True if this detection's FRP is hot enough to override flare suppression."""
+        return hs.frp is not None and hs.frp >= self.flare_override_min_frp
+
+    def _drop_static_sources(
+        self, hotspots: list[Hotspot], persistent_cells: set[str] | None = None
+    ) -> list[Hotspot]:
+        """
+        Remove detections at persistent static sources (gas flares) — except
+        those hot enough (FRP >= flare_override_min_frp) to plausibly be a real,
+        possibly-growing wildfire rather than industrial heat. See the safety
+        note on flare_override_min_frp in __init__.
+        """
         if not self.filter_static_sources:
             return hotspots
-        persistent = self.db.get_persistent_cells(
-            self.flare_min_days, self.flare_window_days
+        persistent = (
+            persistent_cells
+            if persistent_cells is not None
+            else self.db.get_persistent_cells(self.flare_min_days, self.flare_window_days)
         )
         if not persistent:
             return hotspots
-        return [hs for hs in hotspots if hs.cell not in persistent]
+        return [
+            hs
+            for hs in hotspots
+            if hs.cell not in persistent or self._is_flare_override(hs)
+        ]
+
+    def _subscribers_near(self, hs: Hotspot, subscribers) -> list[int]:
+        """chat_ids of active subscribers this hotspot would match (radius/wilaya)."""
+        ids = []
+        for sub in subscribers:
+            if sub["mode"] == MODE_WILAYA and sub["wilaya_code"] is not None:
+                wilaya = next(
+                    (w for w in geo_utils.load_wilayas() if w["code"] == sub["wilaya_code"]),
+                    None,
+                )
+                if wilaya and geo_utils.wilaya_contains(wilaya, hs.latitude, hs.longitude):
+                    ids.append(sub["chat_id"])
+            elif sub["latitude"] is not None and sub["longitude"] is not None:
+                d = geo_utils.haversine(
+                    sub["latitude"], sub["longitude"], hs.latitude, hs.longitude
+                )
+                if d <= self.radius_km:
+                    ids.append(sub["chat_id"])
+        return ids
+
+    def _log_subscriber_relevant_hotspots(
+        self, hotspots: list[Hotspot], persistent_cells: set[str]
+    ) -> None:
+        """
+        For every hotspot that falls within an active subscriber's alert radius
+        (or wilaya), log whether it passed each filter stage and why —
+        confidence, Algeria bbox, gas-flare suppression (with distinct-day count
+        and any FRP override), and the de-dupe cache. Purely diagnostic: never
+        changes which alerts are sent. Answers "why didn't I get alerted?"
+        directly from the logs.
+        """
+        if not logger.isEnabledFor(logging.INFO):
+            return
+        subscribers = self.db.get_active_subscribers()
+        if not subscribers:
+            return
+
+        for hs in hotspots:
+            near = self._subscribers_near(hs, subscribers)
+            if not near:
+                continue
+
+            conf_ok = passes_confidence(hs, self.min_confidence)
+            bbox_ok = geo_utils.in_algeria_bbox(hs.latitude, hs.longitude)
+            is_flare_cell = self.filter_static_sources and hs.cell in persistent_cells
+            day_count = (
+                self.db.get_cell_day_count(hs.cell, self.flare_window_days)
+                if is_flare_cell
+                else None
+            )
+            frp_override = is_flare_cell and self._is_flare_override(hs)
+            is_known = self.db.is_hotspot_known(hs.dedupe_key())
+
+            if not conf_ok:
+                verdict = (
+                    f"REJECTED - confidence '{hs.confidence}' below threshold "
+                    f"'{self.min_confidence}'"
+                )
+            elif not bbox_ok:
+                verdict = "REJECTED - outside Algeria bounding box"
+            elif is_flare_cell and not frp_override:
+                verdict = (
+                    f"SUPPRESSED - gas-flare/static source: cell seen on "
+                    f"{day_count} distinct day(s), >= flare_min_days="
+                    f"{self.flare_min_days} within {self.flare_window_days}d window "
+                    f"(FRP={hs.frp} below override threshold "
+                    f"{self.flare_override_min_frp} MW)"
+                )
+            elif is_flare_cell and frp_override:
+                verdict = (
+                    f"PASSED - cell looked persistent ({day_count} day(s)) but "
+                    f"FRP={hs.frp} MW >= override threshold "
+                    f"{self.flare_override_min_frp} MW -> treated as a real fire"
+                )
+            elif is_known:
+                verdict = "SKIPPED - already alerted for this exact detection (dedupe cache)"
+            else:
+                verdict = "PASSED - will be alerted"
+
+            logger.info(
+                "[trace] cell=%s date=%s time=%s conf=%s frp=%s near_subscribers=%s -> %s",
+                hs.cell, hs.acq_date, hs.acq_time, hs.confidence, hs.frp, near, verdict,
+            )
 
     async def _resolve_places(self, hotspots: list[Hotspot]) -> dict:
         """
         Reverse-geocode the unique cells of ``hotspots`` to place names.
 
-        Returns ``{cell: GeoPlace}``; cells absent from the map (no name, or over
-        the per-cycle live-request budget) fall back to wilaya naming. Fully
-        best-effort — any failure just yields fewer/zero resolved places.
+        Returns ``{cell: GeoPlace}``; cells absent from the map (no name, over
+        the per-cycle request count budget, or past the wall-clock time budget)
+        fall back to wilaya naming. Fully best-effort — any failure, timeout, or
+        budget cutoff just yields fewer/zero resolved places; it NEVER raises and
+        never meaningfully delays sending the actual alert (see
+        geocode_max_seconds_per_cycle in __init__ for why this matters).
         """
         if not self.geocoder:
             return {}
         place_map: dict = {}
         budget = _GEOCODE_MAX_PER_CYCLE
         seen: set[str] = set()
+        start = time.monotonic()
+        time_exceeded = False
+        skipped_on_time = 0
         for hs in hotspots:
             cell = hs.cell
             if cell in seen:
                 continue
             seen.add(cell)
+
+            if not time_exceeded and (time.monotonic() - start) >= self.geocode_max_seconds_per_cycle:
+                time_exceeded = True
+                logger.warning(
+                    "Geocoding wall-clock budget (%.0fs) reached; remaining new "
+                    "cells this cycle will use wilaya names instead.",
+                    self.geocode_max_seconds_per_cycle,
+                )
+
+            if time_exceeded and not self.geocoder.is_cached(hs.latitude, hs.longitude):
+                # Don't even attempt it — any network call here would add more
+                # delay to alerts that are already waiting to go out.
+                skipped_on_time += 1
+                continue
+
             try:
                 place, network_used = await self.geocoder.resolve(
                     hs.latitude, hs.longitude, allow_network=(budget > 0)
@@ -212,6 +370,13 @@ class AlertEngine:
                 budget -= 1
             if place is not None:
                 place_map[cell] = place
+
+        if skipped_on_time:
+            logger.info(
+                "%d cell(s) skipped geocoding this cycle (time budget) — "
+                "will use wilaya naming; may resolve on a later poll.",
+                skipped_on_time,
+            )
         return place_map
 
     def _display_fields(self, match: "Match", place_map: dict, lang: str):

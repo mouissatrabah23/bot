@@ -59,6 +59,15 @@ def test_cell_key_rounds_to_two_decimals():
     assert cell_key(36.7551, 5.0649) == "36.76:5.06"
 
 
+def test_default_timeout_is_short(db):
+    # Regression guard: this was 15s and, combined with a flaky Nominatim
+    # connection, measured 120+ seconds of added delay to real fire alerts in
+    # testing. Must stay short — a slow request is a dead end, not worth
+    # waiting out, since every second here delays an active wildfire alert.
+    geo = Geocoder(db)
+    assert geo.timeout <= 8.0
+
+
 async def test_resolve_hits_network_then_caches(db, monkeypatch):
     geo, calls, patched_init = _geocoder_with_counter(db, NOMINATIM_JSON)
     monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)

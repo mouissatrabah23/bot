@@ -63,8 +63,15 @@ class Geocoder:
         user_agent: str = DEFAULT_USER_AGENT,
         language: str = "ar",
         min_interval: float = 1.1,
-        timeout: float = 15.0,
+        timeout: float = 6.0,
     ):
+        # NOTE on timeout: this is a per-REQUEST cap, not a cycle-wide one. Kept
+        # short (default 6s, not the httpx-typical 15-30s) because Nominatim
+        # normally answers in well under a second — a slow/unreachable request
+        # is far more likely a dead end than a request worth waiting out, and
+        # every second here is a second an active wildfire alert is delayed.
+        # The wall-clock budget across a whole polling cycle is enforced by the
+        # caller (see AlertEngine.geocode_max_seconds_per_cycle in alerts.py).
         self.db = db
         self.user_agent = user_agent
         self.language = language

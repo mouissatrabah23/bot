@@ -30,10 +30,10 @@ class FakeBot:
         return True
 
 
-def _hs(lat, lon, date, time="1200", conf="n"):
+def _hs(lat, lon, date, time="1200", conf="n", frp=1.0):
     return Hotspot(
         latitude=lat, longitude=lon, confidence=conf, acq_date=date, acq_time=time,
-        satellite="N", instrument="VIIRS", frp=1.0, daynight="D",
+        satellite="N", instrument="VIIRS", frp=frp, daynight="D",
     )
 
 
@@ -120,3 +120,140 @@ async def test_filter_can_be_disabled(db):
     await engine.process_hotspots(poll)
     # With the filter off, even a persistent cell alerts.
     assert len(engine.bot.sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# Safety override: a real, sustained wildfire must NOT go silent just because
+# it keeps burning in roughly the same spot for several days. Reported by a
+# user who saw exactly this — one alert at subscription, then nothing for
+# hours despite a real, ongoing, reported fire.
+# ---------------------------------------------------------------------------
+
+async def test_low_frp_persistent_cell_stays_suppressed(db):
+    """Baseline: a low-FRP persistent cell (a real flare) is still suppressed."""
+    engine = AlertEngine(bot=FakeBot(), db=db, radius_km=15, min_confidence=None,
+                         flare_min_days=3, flare_window_days=10,
+                         flare_override_min_frp=10.0)
+    db.upsert_gps_subscriber(1, 31.95, 5.32, language="en")
+
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone.utc).date()
+    db.record_cell_observations([
+        ("31.95:5.32", (today - timedelta(days=d)).strftime("%Y-%m-%d")) for d in (1, 2, 3)
+    ])
+    poll = [_hs(31.95, 5.32, today.strftime("%Y-%m-%d"), frp=1.8)]  # flare-like FRP
+    await engine.process_hotspots(poll)
+    assert len(engine.bot.sent) == 0
+
+
+async def test_high_frp_overrides_persistent_suppression(db):
+    """A hot enough detection in a persistent cell is NOT suppressed."""
+    engine = AlertEngine(bot=FakeBot(), db=db, radius_km=15, min_confidence=None,
+                         flare_min_days=3, flare_window_days=10,
+                         flare_override_min_frp=10.0)
+    db.upsert_gps_subscriber(1, 36.90, 7.76, language="en")
+
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone.utc).date()
+    db.record_cell_observations([
+        ("36.90:7.76", (today - timedelta(days=d)).strftime("%Y-%m-%d")) for d in (1, 2, 3)
+    ])
+    poll = [_hs(36.90, 7.76, today.strftime("%Y-%m-%d"), frp=25.0)]  # well above override
+    await engine.process_hotspots(poll)
+    assert len(engine.bot.sent) == 1
+
+
+async def test_sustained_growing_wildfire_is_not_silenced_on_day3(db):
+    """
+    Regression test for the exact reported bug: a real fire that keeps burning
+    in roughly the same footprint, with FRP rising day over day, must keep
+    alerting on day 3 (when the old day-count-only rule would have gone silent)
+    because its FRP crosses the override threshold.
+    """
+    engine = AlertEngine(bot=FakeBot(), db=db, radius_km=15, min_confidence="n",
+                         flare_min_days=3, flare_window_days=10,
+                         flare_override_min_frp=10.0)
+    db.upsert_gps_subscriber(1, 36.90, 7.76, language="ar")
+
+    day1 = [_hs(36.885, 7.631, "2026-07-19", frp=8.0)]
+    day2 = [_hs(36.885, 7.631, "2026-07-20", frp=25.0)]
+    day3 = [_hs(36.885, 7.631, "2026-07-21", frp=60.0)]  # cell now has 3 distinct days
+
+    await engine.process_hotspots(day1)
+    assert len(engine.bot.sent) == 1
+    engine.bot.sent.clear()
+
+    await engine.process_hotspots(day2)
+    assert len(engine.bot.sent) == 1
+    engine.bot.sent.clear()
+
+    await engine.process_hotspots(day3)
+    # Cell IS persistent now (3 distinct days) but FRP=60 >> override -> still alerted.
+    assert len(engine.bot.sent) == 1
+    assert "36.88:7.63" in db.get_persistent_cells(3, 10)  # confirms it WAS flagged persistent
+
+
+async def test_get_cell_day_count(db):
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone.utc).date()
+    db.record_cell_observations([
+        ("30.0:6.0", (today - timedelta(days=d)).strftime("%Y-%m-%d")) for d in (0, 1, 2)
+    ])
+    assert db.get_cell_day_count("30.0:6.0", window_days=10) == 3
+    assert db.get_cell_day_count("30.0:6.0", window_days=0) <= 1  # only "today" qualifies
+    assert db.get_cell_day_count("99.0:99.0", window_days=10) == 0
+
+
+async def test_trace_logging_explains_flare_suppression(db, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="alerts")
+
+    engine = AlertEngine(bot=FakeBot(), db=db, radius_km=15, min_confidence=None,
+                         flare_min_days=3, flare_window_days=10,
+                         flare_override_min_frp=10.0)
+    db.upsert_gps_subscriber(1, 31.95, 5.32, language="en")
+
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone.utc).date()
+    db.record_cell_observations([
+        ("31.95:5.32", (today - timedelta(days=d)).strftime("%Y-%m-%d")) for d in (1, 2, 3)
+    ])
+    poll = [_hs(31.95, 5.32, today.strftime("%Y-%m-%d"), frp=1.8)]
+    await engine.process_hotspots(poll)
+
+    trace_lines = [r.getMessage() for r in caplog.records if "[trace]" in r.getMessage()]
+    assert len(trace_lines) == 1
+    assert "SUPPRESSED" in trace_lines[0]
+    assert "gas-flare" in trace_lines[0]
+
+
+async def test_trace_logging_explains_pass_and_override(db, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="alerts")
+
+    engine = AlertEngine(bot=FakeBot(), db=db, radius_km=15, min_confidence=None,
+                         flare_min_days=3, flare_window_days=10,
+                         flare_override_min_frp=10.0)
+    db.upsert_gps_subscriber(1, 36.90, 7.76, language="en")
+
+    poll = [_hs(36.90, 7.76, "2026-07-22", frp=5.0)]  # brand-new, not persistent
+    await engine.process_hotspots(poll)
+
+    trace_lines = [r.getMessage() for r in caplog.records if "[trace]" in r.getMessage()]
+    assert len(trace_lines) == 1
+    assert "PASSED - will be alerted" in trace_lines[0]
+
+
+async def test_trace_logging_ignores_hotspots_far_from_any_subscriber(db, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="alerts")
+
+    engine = AlertEngine(bot=FakeBot(), db=db, radius_km=15, min_confidence=None)
+    db.upsert_gps_subscriber(1, 36.90, 7.76, language="en")  # Annaba
+
+    # Far from the only subscriber (Tamanrasset, deep south).
+    poll = [_hs(22.78, 5.52, "2026-07-22")]
+    await engine.process_hotspots(poll)
+
+    trace_lines = [r.getMessage() for r in caplog.records if "[trace]" in r.getMessage()]
+    assert trace_lines == []

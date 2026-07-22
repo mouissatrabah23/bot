@@ -269,6 +269,21 @@ class Database:
             ).fetchall()
             return {r["cell"] for r in rows}
 
+    def get_cell_day_count(self, cell: str, window_days: int) -> int:
+        """Distinct days ``cell`` was observed within the trailing window_days."""
+        cutoff = (
+            datetime.now(timezone.utc) - _timedelta_days(window_days)
+        ).strftime("%Y-%m-%d")
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(DISTINCT obs_date) AS c FROM cell_observations
+                WHERE cell = ? AND obs_date >= ?
+                """,
+                (cell, cutoff),
+            ).fetchone()
+            return row["c"] if row else 0
+
     def prune_old_cell_observations(self, older_than_days: int = 30) -> int:
         """Drop cell observations older than N days to bound table growth."""
         cutoff = (

@@ -179,8 +179,11 @@ See [.env.example](.env.example) for the full, commented list. The essentials:
 | `FILTER_STATIC_SOURCES` | — | `true` | Suppress gas flares / static thermal sources |
 | `FLARE_MIN_DAYS` | — | `3` | Distinct days at a spot to call it a static source |
 | `FLARE_WINDOW_DAYS` | — | `10` | Look-back window for the flare test |
+| `FLARE_OVERRIDE_MIN_FRP` | — | `10` | FRP (MW) that overrides flare suppression |
 | `ENABLE_GEOCODING` | — | `true` | Reverse-geocode place names (Nominatim) |
 | `GEOCODING_LANGUAGE` | — | `ar` | Language for geocoded place names |
+| `GEOCODE_TIMEOUT_SECONDS` | — | `6` | Per-request Nominatim timeout |
+| `GEOCODE_MAX_SECONDS_PER_CYCLE` | — | `20` | Hard cap on total geocoding time per poll |
 | `TELEGRAM_TIMEOUT` | — | `20` | Network timeout (s) for Telegram calls |
 | `TELEGRAM_PROXY` | — | *(off)* | Proxy for reaching Telegram if throttled |
 | `DATABASE_PATH` | — | `yaqadha.db` | SQLite file location |
@@ -229,15 +232,45 @@ automatically: any ~1km cell detected on `FLARE_MIN_DAYS` distinct days within
 `FLARE_WINDOW_DAYS` is treated as a persistent static source and suppressed
 (`FILTER_STATIC_SOURCES=true`). This works from the first poll thanks to the
 5-day `FIRMS_DAY_RANGE`, and keeps improving as the bot accumulates history.
-Genuine wildfires are transient, so they pass through. Set
+Most wildfires are transient, so they pass through. Set
 `FILTER_STATIC_SOURCES=false` to disable, or raise `FLARE_MIN_DAYS` to filter
 less aggressively.
+
+**Safety override for multi-day fires.** A real fire that keeps burning or
+reigniting in roughly the same ~1km spot for several days *looks identical* to
+a gas flare under the day-count rule alone — and would otherwise go silent
+right when it matters most. To prevent that, any detection whose FRP (fire
+radiative power) is at or above `FLARE_OVERRIDE_MIN_FRP` (default 10 MW) is
+always treated as a real fire and alerted, regardless of how "persistent" its
+cell looks. Lower the threshold if you'd rather over-alert than risk missing a
+growing fire.
+
+**Diagnosing "why didn't I get an alert?"** Every poll cycle logs, at `INFO`
+level, a `[trace]` line for every hotspot that falls within an active
+subscriber's radius/wilaya, whatever the outcome:
+```
+[trace] cell=36.88:7.63 date=2026-07-21 time=1200 conf=n frp=60.0 near_subscribers=[123456] -> PASSED - cell looked persistent (3 day(s)) but FRP=60.0 MW >= override threshold 10.0 MW -> treated as a real fire
+```
+This never affects which alerts are sent — it's purely diagnostic, so you can
+grep the logs for a subscriber's chat_id or a location and see exactly which
+filter (confidence, bbox, gas-flare, dedupe cache) a given detection did or
+didn't pass, and why.
 
 **Network `TimedOut` / `ConnectTimeout` errors.** The bot uses generous
 timeouts (`TELEGRAM_TIMEOUT`) and retries automatically, so occasional ones are
 harmless. If they're constant, your network may be throttling Telegram — set
 `TELEGRAM_PROXY` (e.g. `socks5://127.0.0.1:9050`, plus
 `pip install "httpx[socks]"`).
+
+**Alerts feel slow to arrive even though FIRMS returned data quickly.** This
+was previously possible if Nominatim (used for precise place names) was slow
+or unreachable — a degraded connection could add minutes of delay to a single
+poll, since alerts waited for geocoding to finish. This is now capped:
+geocoding never adds more than `GEOCODE_MAX_SECONDS_PER_CYCLE` (default 20s)
+to a cycle — past that, un-cached cells fall back to their wilaya name for that
+cycle and alerts go out immediately. Lower `GEOCODE_MAX_SECONDS_PER_CYCLE` or
+set `ENABLE_GEOCODING=false` if you want alerts to never wait on geocoding at
+all.
 
 ---
 
